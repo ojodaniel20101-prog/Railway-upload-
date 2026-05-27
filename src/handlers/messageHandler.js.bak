@@ -1,0 +1,306 @@
+/**
+ * messageHandler.js — Central dispatcher for all incoming WhatsApp messages.
+ * PHASE 2 FIX: Hard session isolation — only the session owner triggers commands.
+ * Routes messages to the protection system and command router.
+ */
+import { commandRouter } from './commandRouter.js';
+import { environment } from '../config/environment.js';
+import { extractMessageText, normalizeJidToNumber } from '../utils/helpers.js';
+import logger from '../utils/logger.js';
+import { sessionManager } from '../core/sessionManager.js';
+import protectionSystem from '../services/protectionSystem.js';
+import behavioralEngine from '../services/behavioralEngine.js';
+import { getChatSettings, storeMessage, getPrefixForSession, getUserStickerCmds } from '../services/databaseService.js';
+import { downloadContentFromMessage, getContentType } from '@whiskeysockets/baileys';
+import { processReaction } from '../services/reactionService.js';
+import { recordActivity } from '../services/activityService.js';
+import { automationService } from '../services/automationService.js';
+import { getStickerFingerprint } from '../commands/whatsapp/setcmd.js';
+
+export async function handleWhatsAppMessage(sock, msg) {
+  if (!msg.message) return;
+
+  const jid     = msg.key.remoteJid;
+  const isGroup = jid.endsWith('@g.us');
+
+  const botNumber = normalizeJidToNumber(sock.user?.id, sock);
+  const botJid    = botNumber + '@s.whatsapp.net';
+
+  const ownerNumber = process.env.OWNER_NUMBER || '2349057467015';
+
+  const senderJid    = isGroup
+    ? (msg.key.participant || botJid)
+    : (msg.key.fromMe ? botJid : jid);
+  const senderNumber = normalizeJidToNumber(senderJid, sock);
+
+  const messageText = extractMessageText(msg);
+  const prefix      = getPrefixForSession(botNumber);
+  const isCommand   = !!(messageText && messageText.startsWith(prefix));
+
+  if (msg.message && !msg.key.fromMe) {
+    storeMessage(botNumber, jid, msg);
+    if (isGroup) {
+      const senderJid = msg.key.participant || msg.key.remoteJid;
+      recordActivity(botNumber, jid, senderJid);
+    }
+  }
+
+  const messageContent = msg.message;
+  if (!messageContent) return;
+  const messageType = Object.keys(messageContent)[0];
+  const contextInfo = messageContent?.[messageType]?.contextInfo || {};
+
+  const cleanJid = (rawJid) => {
+    if (!rawJid) return '';
+    try { rawJid = sock.decodeJid(rawJid); } catch (_) {}
+    return rawJid.split(':')[0];
+  };
+
+  const isSameUser = (jid1, jid2) => {
+    if (!jid1 || !jid2) return false;
+    const a = cleanJid(jid1);
+    const b = cleanJid(jid2);
+    if (a === b) return true;
+    return a.split('@')[0] === b.split('@')[0];
+  };
+
+  const ownerJid      = cleanJid(ownerNumber + '@s.whatsapp.net');
+  const sessionBotJid = cleanJid(sock.user?.id);
+
+  const quotedSender =
+    contextInfo?.participant ||
+    contextInfo?.remoteJid ||
+    contextInfo?.quotedMessage?.sender ||
+    null;
+
+  const isReplyToBotOrOwner =
+    !!(contextInfo?.quotedMessage) &&
+    (isSameUser(quotedSender, sessionBotJid) || isSameUser(quotedSender, ownerJid));
+
+  const mentionedJids = contextInfo?.mentionedJid || [];
+  const isMentionedBotOrOwner = mentionedJids.some(
+    j => isSameUser(j, sessionBotJid) || isSameUser(j, ownerJid)
+  );
+
+  const isReplyToAnyone = !!(contextInfo?.quotedMessage);
+
+  const settings            = getChatSettings(botNumber, jid);
+  const isAichatEnabled     = settings.automation?.aichat?.enabled;
+  const isAutoreactEnabled  = settings.automation?.autoreact?.enabled;
+  const isAutorecordEnabled = settings.automation?.autorecord?.enabled;
+  const isAutotypeEnabled   = settings.automation?.autotype?.enabled;
+  const isAutoviewEnabled   = settings.automation?.autoview?.enabled;
+  const isAutoreplyEnabled  = settings.automation?.autoreply?.enabled;
+
+  const anyAutomationActive =
+    isAichatEnabled || isAutoreactEnabled || isAutorecordEnabled ||
+    isAutotypeEnabled || isAutoviewEnabled || isAutoreplyEnabled;
+
+  // ── Filter Logic ──────────────────────────────────────────────────────────
+  // Pass through sticker messages so bound sticker commands can fire.
+  // Pass through groupStatusMentionMessage so antigroupmention can catch and delete it.
+  const isStickerMsg = messageType === 'stickerMessage';
+  const isStatusMentionNotification = !!(
+    messageContent?.groupStatusMentionMessage ||
+    messageContent?.groupStatusMessageV2 ||
+    messageContent?.groupStatusMessage ||
+    messageContent?.extendedTextMessage?.contextInfo?.isGroupStatus
+  );
+  if (
+    isGroup &&
+    !isReplyToBotOrOwner &&
+    !isMentionedBotOrOwner &&
+    !isCommand &&
+    !anyAutomationActive &&
+    !isStickerMsg &&
+    !isStatusMentionNotification
+  ) {
+    return;
+  }
+
+  if (isGroup && !msg.key.fromMe && isCommand) {
+    const session = sessionManager.getSession(botNumber);
+    if (session?.commandMode === 'self') {
+      return;
+    }
+  }
+
+  // 1. Protection System
+  if (isGroup) {
+    try {
+      const triggered = await protectionSystem.runAll(sock, msg);
+      if (triggered) return;
+    } catch (protError) {
+      logger.error(`[MessageHandler] Protection system error: ${protError.message}`);
+    }
+    // 2. Behavioral Engine
+    try {
+      await behavioralEngine.processMessage(sock, msg);
+    } catch (behavError) {
+      logger.error(`[MessageHandler] Behavioral engine error: ${behavError.message}`);
+    }
+  }
+
+  // 3. VV3 Auto-Capture
+  try {
+    if (settings.automation?.vv3?.enabled) {
+      const { normalizeMessageContent } = await import('@whiskeysockets/baileys');
+      const normalized  = normalizeMessageContent(msg.message);
+      const isViewOnce  = !!(
+        msg.message?.viewOnceMessage ||
+        msg.message?.viewOnceMessageV2 ||
+        msg.message?.viewOnceMessageV2Extension
+      );
+      if (isViewOnce && normalized) {
+        const mediaType = normalized.imageMessage ? 'image' : normalized.videoMessage ? 'video' : null;
+        if (mediaType) {
+          const mediaMessage = normalized[`${mediaType}Message`];
+          const caption      = mediaMessage.caption || '';
+          const stream       = await downloadContentFromMessage(mediaMessage, mediaType);
+          const chunks       = [];
+          for await (const chunk of stream) chunks.push(chunk);
+          const buffer       = Buffer.concat(chunks);
+          await sock.sendMessage(botJid, {
+            [mediaType]: buffer,
+            caption: `*ZENTRIX MD VV3 (Auto Capture)*\n\n*From:* ${jid}\n*Sender:* ${normalizeJidToNumber(msg.key.participant || jid, sock)}\n*Type:* ${mediaType}${caption ? `\n*Caption:* ${caption}` : ''}`,
+          });
+        }
+      }
+    }
+  } catch (vv3Error) {
+    logger.error(`[MessageHandler] VV3 Auto-Capture error: ${vv3Error.message}`);
+  }
+
+  // 4. Automation Features
+  try {
+    if (isAutorecordEnabled) {
+      await automationService.autoRecord(sock, jid);
+      await new Promise(res => setTimeout(res, 500));
+    }
+    if (isAutoviewEnabled) {
+      await automationService.autoView(sock, msg, jid, botNumber, ownerNumber);
+      await new Promise(res => setTimeout(res, 300));
+    }
+    if (isAutotypeEnabled && messageText && !isCommand) {
+      await automationService.autoType(sock, jid, messageText);
+      await new Promise(res => setTimeout(res, 500));
+    }
+    if (isAutoreplyEnabled) {
+      await automationService.autoReply(sock, msg, jid);
+    }
+  } catch (automationError) {
+    logger.error(`[MessageHandler] Automation error: ${automationError.message}`);
+  }
+
+  // 5. Global AI Chatbot Mode
+  if (messageText && !messageText.startsWith(prefix)) {
+    try {
+      const shouldTriggerAichat =
+        isAichatEnabled &&
+        (
+          !isGroup ||
+          isReplyToBotOrOwner ||
+          isMentionedBotOrOwner ||
+          (isGroup && isReplyToAnyone && isSameUser(quotedSender, sessionBotJid))
+        );
+      if (shouldTriggerAichat) {
+        const { gptCommand } = await import('../commands/whatsapp/aiCommands.js');
+        const userId   = senderNumber + '@s.whatsapp.net';
+        const userName = msg.pushName || 'User';
+        const botMentionRegex = new RegExp('@' + botNumber + '\\s*', 'gi');
+        const cleanText = messageText.replace(botMentionRegex, '').trim() || messageText;
+        await gptCommand.execute({
+          sock, msg,
+          args: cleanText.split(' '),
+          sessionManager,
+          phoneNumber: botNumber,
+          userId, userName, isGroup
+        });
+        return;
+      }
+    } catch (aiChatError) {
+      logger.error(`[MessageHandler] Global AI Chat error: ${aiChatError.message}`);
+    }
+  }
+
+  // 6. Auto-React System
+  try {
+    await processReaction(sock, msg, jid, isGroup, botNumber);
+  } catch (reactionError) {
+    logger.error(`[MessageHandler] Auto-React error: ${reactionError.message}`);
+  }
+
+  // ── Sticker Command Trigger ───────────────────────────────────────────────
+  if (messageType === 'stickerMessage') {
+    try {
+      const fingerprint = getStickerFingerprint(msg);
+      if (fingerprint) {
+        // Resolve the sender JID — the bot owner who set the binding
+        const isGroup   = jid.endsWith('@g.us');
+        const senderJid = isGroup
+          ? (msg.key.participant || msg.key.remoteJid)
+          : msg.key.remoteJid;
+        // Also check against the bot's own number (fromMe in group / DM)
+        const botJid = botNumber + '@s.whatsapp.net';
+        const lookupJid = msg.key.fromMe ? botJid : senderJid;
+        const stickerCmds  = getUserStickerCmds(lookupJid);
+        const boundCommand = stickerCmds[fingerprint];
+        if (boundCommand) {
+          logger.info(`[MessageHandler] Sticker command triggered: "${boundCommand}" | Fingerprint: ${fingerprint.slice(0, 12)}…`);
+          await commandRouter.execute('whatsapp', boundCommand.toLowerCase(), {
+            sock, msg, args: [], sessionManager, phoneNumber: botNumber,
+          });
+          return;
+        }
+      }
+    } catch (stickerCmdError) {
+      logger.error(`[MessageHandler] Sticker command error: ${stickerCmdError.message}`);
+    }
+  }
+
+  if (!messageText || !messageText.startsWith(prefix)) return;
+
+  const [commandName, ...args] = messageText.slice(prefix.length).trim().split(/ +/);
+  if (!commandName) return;
+
+  const normalizedCommand = commandName.toLowerCase();
+  logger.info(`[MessageHandler] Command received: "${normalizedCommand}" | Args: [${args.join(', ')}]`);
+
+
+  // ── ANTIHIJACK: .hijack command interception ─────────────────────────────
+  // If antihijack is enabled and someone types .hijack, lock the group immediately.
+  if (isGroup && normalizedCommand === 'hijack') {
+    const ahSettings = getChatSettings(botNumber, jid);
+    if (ahSettings?.protection?.antihijack?.enabled) {
+      logger.warn(`[ANTIHIJACK] .hijack detected from ${senderNumber} in ${jid}. Locking group...`);
+      try {
+        await sock.groupSettingUpdate(jid, 'announcement');
+        await sock.sendMessage(jid, {
+          text: `🛡️ *ANTIHIJACK — GROUP LOCKED*\n\n⚠️ A hijack attempt was detected.\nThe group has been locked to admins only.\n\nActor: @${senderNumber}`,
+          mentions: [senderJid]
+        });
+      } catch (e) {
+        logger.error(`[ANTIHIJACK] Failed to lock group: ${e.message}`);
+      }
+      return; // block the hijack command from executing
+    }
+  }
+
+  try {
+    if (settings.automation?.autotype?.enabled) {
+      await automationService.autoType(sock, jid, messageText);
+    }
+    await commandRouter.execute('whatsapp', normalizedCommand, {
+      sock, msg, args, sessionManager, phoneNumber: botNumber
+    });
+  } catch (error) {
+    logger.error(`[MessageHandler] Error executing command "${normalizedCommand}":`, error);
+    if (error.message) {
+      try {
+        await sock.sendMessage(jid, { text: `❌ ${error.message}` });
+      } catch (sendError) {
+        logger.error('[MessageHandler] Failed to send error reply:', sendError);
+      }
+    }
+  }
+}

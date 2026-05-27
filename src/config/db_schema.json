@@ -1,0 +1,40 @@
+{
+  "groupSettings": {
+    "_id": "<groupId>",
+    "protection": {
+      "antilink": {
+        "enabled": false,
+        "mode": "warn"
+      },
+      "antitag": {
+        "enabled": false,
+        "mode": "warn"
+      },
+      "antibadwords": {
+        "enabled": false,
+        "mode": "warn"
+      },
+      "antiflood": {
+        "enabled": false,
+        "mode": "warn"
+      },
+      "antiinvite": {
+        "enabled": false,
+        "mode": "warn"
+      },
+      "antibot": {
+        "enabled": false,
+        "mode": "warn"
+      },
+      "antipromote": {
+        "enabled": false,
+        "mode": "warn"
+      },
+      "antihijack": {
+        "enabled": false
+      }
+    },
+    "warnings": {},
+    "floodTracker": {}
+  }
+}
