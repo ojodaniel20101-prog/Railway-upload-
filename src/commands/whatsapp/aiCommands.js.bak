@@ -1,0 +1,500 @@
+/**
+ * aiCommands.js — ZENTRIX MD AI
+ * AI  : GPT → apis.prexzyvilla.site
+ * TTS : 29 langs → apis.prexzyvilla.site/tts/tts-{lang}?text=
+ * Audio: TTS mp3 → converted to OGG Opus via ffmpeg for WhatsApp PTT
+ * Identity: Created by ZENTRIX MD BY ZENTRIX TECH | Forged by UNKNOWN DEV
+ */
+
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { fileURLToPath } from 'url';
+import logger from '../../utils/logger.js';
+import { getMemory, appendMessage } from '../../services/aiMemoryService.js';
+import { aiPersonalityPrompt } from '../../config/aiConfig.js';
+import { enhanceResponse } from '../../services/emojiIntelligence.js';
+import { normalizeJidToNumber } from '../../utils/helpers.js';
+import { automationService } from '../../services/automationService.js';
+import { getChatSettings, updateChatSettings } from '../../services/databaseService.js';
+
+const __filename  = fileURLToPath(import.meta.url);
+const __dirname   = path.dirname(__filename);
+const execFileAsync = promisify(execFile);
+
+const API_BASE = 'https://apis.prexzyvilla.site';
+
+// ─── TTS Language Map (display name → endpoint suffix) ────────────────────────
+export const TTS_LANGUAGES = {
+  english:    'en',
+  indonesian: 'id',
+  spanish:    'es',
+  french:     'fr',
+  german:     'de',
+  italian:    'it',
+  portuguese: 'pt',
+  dutch:      'nl',
+  polish:     'pl',
+  russian:    'ru',
+  japanese:   'ja',
+  korean:     'ko',
+  chinese:    'zhcn',
+  taiwanese:  'zhtw',
+  arabic:     'ar',
+  hindi:      'hi',
+  thai:       'th',
+  vietnamese: 'vi',
+  turkish:    'tr',
+  swedish:    'sv',
+  norwegian:  'no',
+  danish:     'da',
+  finnish:    'fi',
+  greek:      'el',
+  hebrew:     'he',
+  czech:      'cs',
+  hungarian:  'hu',
+  romanian:   'ro',
+  ukrainian:  'uk',
+};
+
+// ─── Ensure tmp dir exists ────────────────────────────────────────────────────
+function getTmpDir() {
+  const dir = path.join(__dirname, '../../../tmp/media');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// ─── TTS → OGG Opus (WhatsApp PTT compatible) ────────────────────────────────
+async function textToVoiceNote(text, langSuffix = 'en') {
+  const tmpDir  = getTmpDir();
+  const id      = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const rawFile = path.join(tmpDir, `${id}_raw`);   // unknown format from API
+  const oggFile = path.join(tmpDir, `${id}.ogg`);
+
+  try {
+    // 1. Fetch TTS audio from API
+    const url = `${API_BASE}/tts/tts-${langSuffix}?text=${encodeURIComponent(text)}`;
+    const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 25000 });
+    const buf = Buffer.from(res.data);
+
+    if (buf.byteLength < 500) {
+      logger.warn(`[TTS] Response too small (${buf.byteLength} bytes) — likely an error`);
+      return null;
+    }
+
+    // 2. Save raw bytes (could be mp3, wav, etc.)
+    fs.writeFileSync(rawFile, buf);
+
+    // 3. Convert to OGG Opus with ffmpeg (required by WhatsApp for PTT)
+    await execFileAsync('ffmpeg', [
+      '-y',                    // overwrite
+      '-i', rawFile,           // input (auto-detect format)
+      '-c:a', 'libopus',       // Opus codec — required for WA voice notes
+      '-b:a', '64k',           // 64kbps — clear enough, small enough
+      '-vbr', 'on',
+      '-ar', '48000',          // 48kHz sample rate (Opus standard)
+      '-ac', '1',              // mono
+      oggFile
+    ]);
+
+    // 4. Read converted file
+    const oggBuf = fs.readFileSync(oggFile);
+    return oggBuf;
+
+  } catch (err) {
+    logger.error(`[TTS] Voice note conversion failed: ${err.message}`);
+    return null;
+  } finally {
+    // Clean up temp files
+    try { if (fs.existsSync(rawFile)) fs.unlinkSync(rawFile); } catch (_) {}
+    try { if (fs.existsSync(oggFile)) fs.unlinkSync(oggFile); } catch (_) {}
+  }
+}
+
+// ─── Send WhatsApp Voice Note (PTT) ──────────────────────────────────────────
+async function sendVoiceNote(sock, chatId, oggBuffer, quotedMsg) {
+  await sock.sendMessage(
+    chatId,
+    {
+      audio:    oggBuffer,
+      mimetype: 'audio/ogg; codecs=opus',  // exact mimetype WhatsApp expects
+      ptt:      true,                       // marks it as a voice note
+    },
+    { quoted: quotedMsg }
+  );
+}
+
+// ─── Core AI Call — prexzyvilla (with fallback endpoints) ────────────────────
+const API_BASE_AI = 'https://apis.prexzyvilla.site';
+async function callGPT5(prompt) {
+  const endpoints = [
+    `${API_BASE_AI}/ai/gpt-5?text=`,
+    `${API_BASE_AI}/ai/gpt4?text=`,
+    `${API_BASE_AI}/ai/chatbot?text=`,
+  ];
+
+  for (const endpoint of endpoints) {
+    try {
+      const { data } = await axios.get(endpoint + encodeURIComponent(prompt), { timeout: 30000 });
+      const text =
+        data?.text ||
+        data?.result ||
+        data?.response ||
+        data?.data?.response ||
+        data?.message ||
+        (typeof data === 'string' ? data : null);
+      if (text && text.trim()) return text.trim();
+    } catch (err) {
+      logger.warn(`[AI] Endpoint failed: ${endpoint} — ${err.message}`);
+    }
+  }
+  throw new Error('AI is temporarily unavailable. Please try again later.');
+}
+
+// ─── Main AI Handler ──────────────────────────────────────────────────────────
+async function handleAIRequest({ sock, msg, args, botNumber, userNumber, chatId, userName, isGroup }) {
+  const userInput = args.join(' ').trim();
+  if (!userInput) throw new Error('Please provide a message. Usage: .gpt <your question>');
+
+  // Load memory
+  const memory = await getMemory(botNumber, userNumber, chatId);
+  const historyText = memory.messages
+    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+    .join('\n');
+
+  const userContext = `User Name: ${userName}\nUser Number: ${userNumber}\nChat Type: ${isGroup ? 'Group' : 'Private'}`;
+  const fullPrompt  = `${aiPersonalityPrompt}\n\n${userContext}\n\n${historyText ? `Conversation History:\n${historyText}\n\n` : ''}User: ${userInput}`;
+
+  // Processing indicator
+  await sock.sendMessage(chatId, { react: { text: '🧠', key: msg.key } });
+
+  // Get voicemode settings
+  const settings  = getChatSettings(botNumber, chatId);
+  const vm        = settings.automation?.voicemode;
+  const voiceOn   = vm?.enabled === true;
+  const voiceLang = vm?.lang || 'en';
+
+  try {
+    await automationService.autoType(sock, chatId, userInput);
+
+    // Call GPT-5
+    const aiResponse       = await callGPT5(fullPrompt);
+    const enhancedResponse = enhanceResponse(aiResponse);
+
+    // Save to memory
+    await appendMessage(botNumber, userNumber, chatId, 'user',      userInput);
+    await appendMessage(botNumber, userNumber, chatId, 'assistant', enhancedResponse);
+
+    // Send text reply
+    await sock.sendMessage(chatId, { text: enhancedResponse }, { quoted: msg });
+
+    // Voice note if voicemode is on
+    if (voiceOn) {
+      const oggBuf = await textToVoiceNote(aiResponse, voiceLang);
+      if (oggBuf) {
+        await sendVoiceNote(sock, chatId, oggBuf, msg);
+      } else {
+        await sock.sendMessage(chatId,
+          { text: '⚠️ _Voice note failed — check TTS service. Text reply sent instead._' },
+          { quoted: msg }
+        );
+      }
+    }
+
+    await sock.sendMessage(chatId, { react: { text: '✅', key: msg.key } });
+
+  } catch (error) {
+    logger.error(`[AI GPT-5] Error: ${error.message}`);
+    throw new Error('AI service is currently unavailable. Please try again later.');
+  }
+}
+
+// ─── .gpt ─────────────────────────────────────────────────────────────────────
+export const gptCommand = {
+  name: 'gpt',
+  execute: async ({ sock, msg, args, phoneNumber, userId, userName, isGroup }) => {
+    await handleAIRequest({
+      sock, msg, args,
+      botNumber:  phoneNumber,
+      userNumber: normalizeJidToNumber(userId, sock),
+      chatId:     msg.key.remoteJid,
+      userName,   isGroup,
+    });
+  }
+};
+
+// ─── .think ───────────────────────────────────────────────────────────────────
+export const thinkCommand = {
+  name: 'think',
+  execute: async ({ sock, msg, args, phoneNumber, userId, userName, isGroup }) => {
+    await handleAIRequest({
+      sock, msg,
+      args:       ['Think step by step and reason carefully:', ...args],
+      botNumber:  phoneNumber,
+      userNumber: normalizeJidToNumber(userId, sock),
+      chatId:     msg.key.remoteJid,
+      userName,   isGroup,
+    });
+  }
+};
+
+// ─── .logic ───────────────────────────────────────────────────────────────────
+export const logicCommand = {
+  name: 'logic',
+  execute: async ({ sock, msg, args, phoneNumber, userId, userName, isGroup }) => {
+    await handleAIRequest({
+      sock, msg,
+      args:       ['Analyze this logically and analytically:', ...args],
+      botNumber:  phoneNumber,
+      userNumber: normalizeJidToNumber(userId, sock),
+      chatId:     msg.key.remoteJid,
+      userName,   isGroup,
+    });
+  }
+};
+
+// ─── .codeai ──────────────────────────────────────────────────────────────────
+export const codeaiCommand = {
+  name: 'codeai',
+  execute: async ({ sock, msg, args, phoneNumber, userId, userName, isGroup }) => {
+    await handleAIRequest({
+      sock, msg,
+      args:       ['You are an expert programmer. Help with this coding task:', ...args],
+      botNumber:  phoneNumber,
+      userNumber: normalizeJidToNumber(userId, sock),
+      chatId:     msg.key.remoteJid,
+      userName,   isGroup,
+    });
+  }
+};
+
+// ─── .chatx ───────────────────────────────────────────────────────────────────
+export const chatxCommand = {
+  name: 'chatx',
+  execute: async ({ sock, msg, args, phoneNumber, userId, userName, isGroup }) => {
+    await handleAIRequest({
+      sock, msg, args,
+      botNumber:  phoneNumber,
+      userNumber: normalizeJidToNumber(userId, sock),
+      chatId:     msg.key.remoteJid,
+      userName,   isGroup,
+    });
+  }
+};
+
+// ─── .aichat on/off ───────────────────────────────────────────────────────────
+export const aichatCommand = {
+  name: 'aichat',
+  execute: async ({ sock, msg, args, isOwner, isAdmin, phoneNumber }) => {
+    if (!isOwner && !isAdmin) throw new Error('This command requires admin or owner privileges.');
+    const jid     = msg.key.remoteJid;
+    const isGroup = jid.endsWith('@g.us');
+    const action  = args[0]?.toLowerCase();
+
+    if (action === 'on') {
+      // Enable globally (works in all chats) AND per current chat
+      updateChatSettings(phoneNumber, jid, { automation: { aichat: { enabled: true } } });
+      const note = isGroup
+        ? ' In groups, I reply when mentioned or replied to.'
+        : ' I will respond to all messages in this chat.';
+      return await sock.sendMessage(jid, {
+        text: `✅ *AI Chatbot* is now *ON*.${note}\n\n🤖 _Powered by GPT-5 | ZENTRIX MD BY ZENTRIX TECH_\n⚡ _Forged by UNKNOWN DEV_`
+      }, { quoted: msg });
+    }
+
+    if (action === 'off') {
+      updateChatSettings(phoneNumber, jid, { automation: { aichat: { enabled: false } } });
+      return await sock.sendMessage(jid, { text: '❌ *AI Chatbot* is now *OFF* for this chat.' }, { quoted: msg });
+    }
+
+    // Status
+    const s      = getChatSettings(phoneNumber, jid);
+    const status = s.automation?.aichat?.enabled ? '🟢 ON' : '🔴 OFF';
+    const vmOn   = s.automation?.voicemode?.enabled ? '🟢 ON' : '🔴 OFF';
+    const vmLang = s.automation?.voicemode?.lang || 'en';
+    const info   = isGroup
+      ? '\n📌 _Groups: replies when mentioned or replied to._'
+      : '\n📌 _DMs: replies to every message._';
+    await sock.sendMessage(jid, {
+      text: `ℹ️ *AI Chat Status:* ${status}${info}\n🎙️ *Voice Mode:* ${vmOn} _(lang: ${vmLang})_\n\n*Commands:*\n• .aichat on/off\n• .chatbot on/off\n• .voicemode english\n• .voicemode off\n\n_ZENTRIX MD BY ZENTRIX TECH | Forged by UNKNOWN DEV_`
+    }, { quoted: msg });
+  }
+};
+
+export const chatbotCommand = {
+  name: 'chatbot',
+  aliases: ['cb'],
+  execute: async ({ sock, msg, args, isOwner, isAdmin, phoneNumber }) => {
+    if (!isOwner && !isAdmin) throw new Error('This command requires admin or owner privileges.');
+    const jid     = msg.key.remoteJid;
+    const isGroup = jid.endsWith('@g.us');
+    const action  = args[0]?.toLowerCase();
+
+    if (action === 'on') {
+      updateChatSettings(phoneNumber, jid, { automation: { aichat: { enabled: true } } });
+      const note = isGroup
+        ? ' In groups, tag me or reply to me to chat.'
+        : ' I will reply to every message in this chat.';
+      return await sock.sendMessage(jid, {
+        text: `🤖 *Chatbot* is now *ON*.${note}\n\n_Powered by ZENTRIX MD AI_`
+      }, { quoted: msg });
+    }
+
+    if (action === 'off') {
+      updateChatSettings(phoneNumber, jid, { automation: { aichat: { enabled: false } } });
+      return await sock.sendMessage(jid, {
+        text: '❌ *Chatbot* is now *OFF* for this chat.'
+      }, { quoted: msg });
+    }
+
+    // Status
+    const s      = getChatSettings(phoneNumber, jid);
+    const status = s.automation?.aichat?.enabled ? '🟢 ON' : '🔴 OFF';
+    await sock.sendMessage(jid, {
+      text: `ℹ️ *Chatbot Status:* ${status}\n\nUsage: *.chatbot on/off*\n${isGroup ? '_Groups: mention or reply to me._' : '_DMs: replies to every message._'}`
+    }, { quoted: msg });
+  }
+};
+
+// ─── .voicemode <language|off> ────────────────────────────────────────────────
+export const voicemodeCommand = {
+  name: 'voicemode',
+  execute: async ({ sock, msg, args, isOwner, isAdmin, phoneNumber }) => {
+    if (!isOwner && !isAdmin) throw new Error('This command requires admin or owner privileges.');
+    const jid   = msg.key.remoteJid;
+    const input = args[0]?.toLowerCase();
+
+    // Show language list
+    if (!input) {
+      const langList = Object.entries(TTS_LANGUAGES)
+        .map(([name, code]) => `• *${name}* (${code})`)
+        .join('\n');
+      return await sock.sendMessage(jid, {
+        text: `🎙️ *Voice Mode — Supported Languages:*\n\n${langList}\n\n*Usage:*\n• .voicemode english\n• .voicemode arabic\n• .voicemode off\n\n_ZENTRIX MD BY ZENTRIX TECH | Forged by UNKNOWN DEV_`
+      });
+    }
+
+    // Turn off
+    if (input === 'off' || input === 'disable') {
+      updateChatSettings(phoneNumber, jid, { automation: { voicemode: { enabled: false, lang: 'en' } } });
+      return await sock.sendMessage(jid, {
+        text: '🔇 *Voice Mode* is now *OFF*. AI will reply in text only.'
+      });
+    }
+
+    // Match language name
+    const langCode = TTS_LANGUAGES[input];
+    if (!langCode) {
+      const similar = Object.keys(TTS_LANGUAGES)
+        .filter(l => l.startsWith(input[0]))
+        .slice(0, 6)
+        .join(', ');
+      return await sock.sendMessage(jid, {
+        text: `❌ Unknown language: *${input}*${similar ? `\n\nSimilar: ${similar}` : ''}\n\nType *.voicemode* to see all supported languages.`
+      });
+    }
+
+    // Save setting
+    updateChatSettings(phoneNumber, jid, {
+      automation: { voicemode: { enabled: true, lang: langCode } }
+    });
+
+    const langDisplay = input.charAt(0).toUpperCase() + input.slice(1);
+
+    await sock.sendMessage(jid, {
+      text: `✅ *Voice Mode* activated!\n🌐 Language: *${langDisplay}* (${langCode})\n\n🎙️ AI will now send both text + voice note replies.\n\n_ZENTRIX MD BY ZENTRIX TECH | Forged by UNKNOWN DEV_`
+    });
+
+    // Demo voice note in the selected language
+    await sock.sendMessage(jid, { react: { text: '🎙️', key: msg.key } });
+    const demoText = `Hello! Voice mode is now active in ${langDisplay}. I am ZENTRIX MD AI, forged by UNKNOWN DEV.`;
+    const oggBuf   = await textToVoiceNote(demoText, langCode);
+    if (oggBuf) {
+      await sendVoiceNote(sock, jid, oggBuf, msg);
+    }
+  }
+};
+
+// ─── .flux / .fluxpro / .flux2 ───────────────────────────────────────────────
+export const fluxCommand = {
+  name: 'flux',
+  description: 'Generate high-quality images using Flux Pro 2 AI.',
+  usage: '.flux <prompt>',
+  category: 'ai image generation',
+  subCategory: 'image',
+  roleRequired: 'user',
+  groupOnly: false,
+  emoji: '🎨',
+  execute: async ({ sock, msg, args }) => {
+    const jid    = msg.key.remoteJid;
+    const prompt = args.join(' ').trim();
+    const react  = (emoji) => sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
+
+    if (!prompt) {
+      await sock.sendMessage(jid, {
+        text: `⚠️ *Usage:* .flux <prompt>\n\n*Example:* .flux a futuristic neon city at night`
+      }, { quoted: msg });
+      return;
+    }
+
+    await react('🎨');
+
+    try {
+      // Step 1 — Kick off generation
+      const { data: initRes } = await axios.get(
+        `https://omegatech-api.dixonomega.tech/api/ai/flux-pro2?prompt=${encodeURIComponent(prompt)}`,
+        { timeout: 15000 }
+      );
+
+      if (!initRes?.success || !initRes?.task_id) {
+        throw new Error('Failed to start generation task.');
+      }
+
+      const taskId = initRes.task_id;
+      let resultUrl = null;
+
+      // Step 2 — Poll every 2s (fast) up to 30 attempts (60s max)
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const { data: check } = await axios.get(
+          `https://omegatech-api.dixonomega.tech/api/ai/nano-banana2-result?task_id=${taskId}`,
+          { timeout: 10000 }
+        );
+        if (check?.status === 'completed' && check?.image_url) {
+          resultUrl = check.image_url;
+          break;
+        }
+        if (check?.status === 'failed') throw new Error('Generation failed on the server.');
+      }
+
+      if (!resultUrl) throw new Error('Generation timed out after 60 seconds.');
+
+      // Step 3 — Send image and react done simultaneously
+      await Promise.all([
+        sock.sendMessage(jid, {
+          image: { url: resultUrl },
+          caption: `✨ *FLUX PRO 2*\n\n📝 *Prompt:* ${prompt}\n\n_ZENTRIX MD BY ZENTRIX TECH | Powered by Omegatech API_`,
+          contextInfo: {
+            forwardedNewsletterMessageInfo: {
+              newsletterJid: '120363425412882254@newsletter',
+              newsletterName: '𝐙𝐄𝐍𝐓𝐑𝐈𝐗 𝐓𝐄𝐂𝐇 𓅯',
+              serverMessageId: -1,
+            },
+          },
+        }, { quoted: msg }),
+        react('✅'),
+      ]);
+
+    } catch (e) {
+      await react('❌');
+      await sock.sendMessage(jid, { text: `❌ *Error:* ${e.message}` }, { quoted: msg });
+    }
+  },
+};
+
+// Aliases
+export const fluxproCommand  = { ...fluxCommand, name: 'fluxpro'  };
+export const fluxpro2Command = { ...fluxCommand, name: 'fluxpro2' };
+export const flux2Command    = { ...fluxCommand, name: 'flux2'    };
