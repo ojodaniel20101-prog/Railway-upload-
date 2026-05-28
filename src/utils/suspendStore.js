@@ -1,20 +1,21 @@
-import fs from 'fs-extra';
+import fs from 'fs/promises';
 import path from 'path';
 
 const FILE = path.join(process.cwd(), 'data', 'suspend.json');
 
 async function load() {
     try {
-        await fs.ensureDir(path.dirname(FILE));
-        return await fs.readJSON(FILE);
+        await fs.mkdir(path.dirname(FILE), { recursive: true });
+        const raw = await fs.readFile(FILE, 'utf-8');
+        return JSON.parse(raw);
     } catch {
         return {};
     }
 }
 
 async function save(data) {
-    await fs.ensureDir(path.dirname(FILE));
-    await fs.writeJSON(FILE, data, { spaces: 2 });
+    await fs.mkdir(path.dirname(FILE), { recursive: true });
+    await fs.writeFile(FILE, JSON.stringify(data, null, 2), 'utf-8');
 }
 
 function norm(jid = '') {
