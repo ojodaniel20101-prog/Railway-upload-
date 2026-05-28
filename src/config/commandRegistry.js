@@ -148,6 +148,28 @@ const commandRegistry = [
     usage: ".unmutemember @user | reply | number"
   },
   {
+    name: "suspend",
+    category: "group management",
+    subCategory: "moderation",
+    roleRequired: "admin",
+    groupOnly: true,
+    botAdminRequired: true,
+    emoji: "⏸️",
+    description: "Temporarily suspends a user — their messages are auto-deleted for the duration.",
+    usage: ".suspend @user 30m | .suspend @user stop"
+  },
+  {
+    name: "tempsilence",
+    category: "group management",
+    subCategory: "moderation",
+    roleRequired: "admin",
+    groupOnly: true,
+    botAdminRequired: true,
+    emoji: "⏸️",
+    description: "Alias for suspend.",
+    usage: ".tempsilence @user 30m | .tempsilence @user stop"
+  },
+  {
     name: "tagall",
     category: "group management",
     subCategory: "moderation",
